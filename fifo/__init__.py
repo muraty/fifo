@@ -5,6 +5,8 @@ import traceback
 import cPickle as pickle
 from importlib import import_module
 from redis import Redis
+from rabbit_sender import Sender
+from rabbit_worker import Worker
 
 logging.basicConfig(format=('%(asctime)s %(levelname)s pid-%(process)d '
                             '%(message)s'),
@@ -25,6 +27,7 @@ EXPIRED = 'expired'
 class FifoClient(object):
     def __init__(self, broker):
         self.redis = Redis.from_url(broker)
+        self.rabbit_sender = Sender(broker)
 
     def queue_task(self, name, task_args, max_wait, result_timeout=60):
         return self.queue_tasks(name, [task_args], max_wait, result_timeout)[0]
@@ -39,7 +42,7 @@ class FifoClient(object):
             'max_wait': max_wait,
             'result_timeout': result_timeout,
         } for args in tasks_args]
-        self.redis.lpush(queue, *[dumps(task) for task in tasks])
+        self.rabbit_sender.push_to_queue(queue, tasks)
         return [task['id'] for task in tasks]
 
     def wait(self, task_id, timeout=None):
@@ -74,34 +77,36 @@ class FifoWorker(object):
         self.queue = module_name
         self.tasks_module = import_module(module_name)
         self.name = name
+        self.rabbit_worker = Worker()
 
     def process_one(self):
-        value = self.redis.brpop(self.queue)
-        if value:
-            task = loads(value[1])
-            logger.info("Task %s (%s) received ",
-                        task['id'], task['function'])
-            q_time = time.time() - task['time']
-            if q_time > task['max_wait']:
-                # Task has waited in the queue for more than the specified max
-                logger.info('Task %s (%s) expired (waited %0.2fs) ',
+        self.rabbit_worker.brpop(self.queue, self.process_message)
+
+    def process_message(self, value):
+        task = value
+        logger.info("Task %s (%s) received ",
+                    task['id'], task['function'])
+        q_time = time.time() - task['time']
+        if q_time > task['max_wait']:
+            # Task has waited in the queue for more than the specified max
+            logger.info('Task %s (%s) expired (waited %0.2fs) ',
+                        task['id'], task['function'], q_time)
+        else:
+            task_function = getattr(self.tasks_module, task['function'])
+            try:
+                result = task_function(*task['args'])
+                task_result = {'status': COMPLETED, 'body': result}
+                logger.info('Task %s (%s) completed (%0.2fs)',
                             task['id'], task['function'], q_time)
-            else:
-                task_function = getattr(self.tasks_module, task['function'])
-                try:
-                    result = task_function(*task['args'])
-                    task_result = {'status': COMPLETED, 'body': result}
-                    logger.info('Task %s (%s) completed (%0.2fs)',
-                                task['id'], task['function'], q_time)
-                except Exception:
-                    logger.exception('Task %s (%s) raised an exception: ',
-                                     task['id'], task['function'])
-                    tb = traceback.format_exc()
-                    task_result = {'status': ERROR, 'body': str(tb)}
-                # if result_timeout <= 0 the client isn't waiting for a result
-                if task['result_timeout'] > 0:
-                    self.redis.lpush(task['id'], dumps(task_result))
-                    self.redis.expire(task['id'], task['result_timeout'])
+            except Exception:
+                logger.exception('Task %s (%s) raised an exception: ',
+                                 task['id'], task['function'])
+                tb = traceback.format_exc()
+                task_result = {'status': ERROR, 'body': str(tb)}
+            # if result_timeout <= 0 the client isn't waiting for a result
+            if task['result_timeout'] > 0:
+                self.redis.lpush(task['id'], dumps(task_result))
+                self.redis.expire(task['id'], task['result_timeout'])
 
     def run(self):
         logger.info("Broker: %s", self.broker)
